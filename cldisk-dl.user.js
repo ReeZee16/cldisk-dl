@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         cldisk-dl
 // @namespace    https://github.com/ReeZee16/cldisk-dl
-// @version      1.4.1
+// @version      1.4.2
 // @description  免梯子流量下载！支持论坛点击与地址栏直链直接访问，自动容灾切换国内高速节点。
 // @author       Antigravity
 // @match        *://*/*
@@ -62,6 +62,12 @@
             hash += `&orig=${encodeURIComponent(origUrl)}`;
         }
         return `https://mooc1.chaoxing.com/${hash}`;
+    }
+
+    // Worker 方案 A 作为脚本直连失败或浏览器未能启动下载时的手动兜底。
+    // 对完整目标地址编码，确保 at_/ak_/ad_ 等 & 参数原样到达 Worker 并由其解码。
+    function getWorkerUrl(targetUrl) {
+        return `https://cldisk-dl.ttjfb.workers.dev/?url=${encodeURIComponent(targetUrl)}`;
     }
 
     // =========================================================================
@@ -233,13 +239,13 @@
 
         <div class="features">
             <div class="feature-item"><span class="ok">✔</span> 0 海外 VPN / 代理流量消耗（境内直连满速）</div>
-            <div class="feature-item"><span class="ok">✔</span> 已自动注入官方节点授权认证（防 403 拦截）</div>
+            <div class="feature-item"><span class="ok">✔</span> 直连未能启动时可使用代理流量重试</div>
             <div class="feature-item"><span class="ok">✔</span> 支持浏览器原生下载与 IDM 32 线程加速</div>
         </div>
 
-        <a id="cx-manual-btn" class="btn-retry" href="#">若未开始下载，点此手动下载</a>
-        <a id="cx-fallback-btn" class="btn-fallback" href="#">如直连异常，点此改用原版代理节点下载</a>
-        <div class="status-hint" id="cx-status-text">⚡ 正在匹配国内最优 CDN 节点...</div>
+        <a id="cx-manual-btn" class="btn-retry" href="#">手动重试免代理下载</a>
+        <a id="cx-fallback-btn" class="btn-fallback" href="#" target="_blank" rel="noopener">使用代理流量重试（会消耗代理流量）</a>
+        <div class="status-hint" id="cx-status-text">⚡ 正在检查免代理直连节点...</div>
     </div>
 </body>
 </html>
@@ -277,38 +283,36 @@
             const fallbackBtn = document.getElementById('cx-fallback-btn');
 
             if (manualBtn) manualBtn.href = rawTargetUrl;
-            if (fallbackBtn && origUrl) {
-                fallbackBtn.href = origUrl + (origUrl.includes('#') ? '' : '#cx_bypass=1');
+            if (fallbackBtn) {
+                fallbackBtn.href = getWorkerUrl(rawTargetUrl);
+                fallbackBtn.style.display = 'inline-block';
             }
 
             let hasClosed = false;
             let takenOverByExt = false;
+            let downloadTriggered = false;
 
             function safeClose(delay = 200) {
                 if (hasClosed) return;
                 hasClosed = true;
-                if (titleEl) {
-                    titleEl.textContent = '免流直连下载已触发';
-                    titleEl.style.color = '#38bdf8';
-                }
-                if (statusText) {
-                    statusText.textContent = '🚀 下载已成功接管，正在尝试关闭窗口...';
-                    statusText.style.color = '#34d399';
-                }
-                setTimeout(() => {
-                    window.close();
-                    setTimeout(() => {
-                        if (!window.closed && statusText) {
-                            statusText.textContent = '✅ 已触发免流下载！下载开始后可手动关闭或离开此页。';
-                        }
-                    }, 300);
-                }, delay);
+                if (titleEl) titleEl.textContent = '下载流程已启动';
+                if (statusText) statusText.textContent = '正在关闭下载页面；若下载未开始，请重新打开链接并选择代理流量重试。';
+                setTimeout(() => window.close(), delay);
             }
 
-            // 提前绑定失焦监听：当 IDM 等下载扩展在探测或下载阶段直接拦截请求并弹窗时，立刻识别为接管成功
+            function startWorkerFallback(message) {
+                if (titleEl) titleEl.textContent = '正在使用代理流量重试';
+                if (statusText) statusText.textContent = message || '正在自动使用代理流量重试下载。';
+                location.assign(getWorkerUrl(rawTargetUrl));
+                // 留出时间让用户看到自动切换提示；Worker 返回附件时页面本身通常不会导航离开。
+                setTimeout(() => safeClose(0), 3000);
+            }
+
+            // 只在实际触发下载后观察失焦，避免探测请求阶段的焦点变化被误判为下载已开始。
             window.addEventListener('blur', () => {
+                if (!downloadTriggered) return;
                 takenOverByExt = true;
-                safeClose(120);
+                safeClose(350);
             });
 
             // 构造候选节点列表
@@ -328,11 +332,17 @@
             let lastTriedUrl = rawTargetUrl;
 
             for (let i = 0; i < candidates.length; i++) {
-                if (takenOverByExt || hasClosed) return;
+                if (takenOverByExt || hasClosed) {
+                    safeClose(350);
+                    return;
+                }
                 const candidate = candidates[i];
                 lastTriedUrl = candidate;
                 const res = await probeSimpleGet(candidate);
-                if (takenOverByExt || hasClosed) return;
+                if (takenOverByExt || hasClosed) {
+                    safeClose(350);
+                    return;
+                }
 
                 lastStatus = res.status;
                 if (res.ok) {
@@ -348,7 +358,10 @@
             if (!activeUrl && hadNetworkAbort) {
                 if (statusText) statusText.textContent = '⚡ 正在确认下载器接管状态...';
                 await new Promise((r) => setTimeout(r, 450));
-                if (takenOverByExt || hasClosed) return;
+                if (takenOverByExt || hasClosed) {
+                    safeClose(350);
+                    return;
+                }
             }
 
             // 仅当最后一个节点未返回明确的 4xx/5xx HTTP 错误时，才用优选节点触发一次原生下载
@@ -364,12 +377,10 @@
                     titleEl.style.color = '#fbbf24';
                 }
                 if (statusText) {
-                    statusText.textContent = `直连节点返回 HTTP ${lastStatus}，请点击下方按钮切换原版代理下载。`;
+                    statusText.textContent = `直连节点返回 HTTP ${lastStatus}，可以点击下方按钮使用代理流量重试。`;
                     statusText.style.color = '#cbd5e1';
                 }
-                if (fallbackBtn && origUrl) {
-                    fallbackBtn.style.display = 'inline-block';
-                }
+                startWorkerFallback('直连节点不可用，正在自动使用代理流量重试下载。');
                 return;
             }
 
@@ -380,11 +391,11 @@
                 if (nodeInfoEl) nodeInfoEl.textContent = `目标源：${activeHost}（国内高速 CDN 已就绪）`;
             } catch (e) {}
             if (titleEl) {
-                titleEl.textContent = '免流直连下载已触发';
+                titleEl.textContent = '免代理下载请求已发起';
                 titleEl.style.color = '#38bdf8';
             }
             if (statusText) {
-                statusText.textContent = '🟢 CDN 握手成功，正在确认接管状态...';
+                statusText.textContent = '🟢 已发起免代理下载，正在等待下载开始信号（最多 3 秒）。';
                 statusText.style.color = '#38bdf8';
             }
 
@@ -393,11 +404,21 @@
             a.setAttribute('download', '');
             a.style.display = 'none';
             document.body.appendChild(a);
-            a.click();
+            downloadTriggered = true;
+            try {
+                a.click();
+            } catch (e) {
+                if (titleEl) titleEl.textContent = '浏览器未能启动直连下载';
+                startWorkerFallback('浏览器未能启动免代理下载，正在使用代理流量重试。');
+                return;
+            }
 
+            // 浏览器没有通用的下载开始事件。失焦只能作为疑似信号；无信号时留给用户判断并手动重试。
             setTimeout(() => {
-                safeClose(200);
-            }, 900);
+                if (takenOverByExt || hasClosed) return;
+                if (titleEl) titleEl.textContent = '请确认下载是否已开始';
+                if (statusText) statusText.textContent = '下载应该已经开始。请检查下载器；若没有开始，请点击下方“使用代理流量重试”按钮。';
+            }, 3000);
         };
 
         if (document.documentElement) {
