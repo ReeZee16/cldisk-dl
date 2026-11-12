@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         cldisk-dl
 // @namespace    https://github.com/ReeZee16/cldisk-dl
-// @version      1.2.0
-// @description  免梯子流量下载！
+// @version      1.3.0
+// @description  免梯子流量下载！支持论坛点击与地址栏直链/代理链接直接访问。
 // @author       Antigravity
 // @match        *://*/*
 // @run-at       document-start
@@ -18,55 +18,69 @@
 
     // =========================================================================
     // 1. 核心解析函数：从各种链接中提取真实下载直链
+    // 支持：
+    // - Worker 代理链接 (?url=https://d0.cldisk.com/... 或 d0.ananas.chaoxing.com/...)
+    // - URL 编码或论坛外链跳转的多层嵌套 (?url=...)
+    // - 原始 CDN 直链 (*.cldisk.com/download/* 或 *.chaoxing.com/download/*)
     // =========================================================================
     function extractTargetUrl(href) {
         if (!href || typeof href !== 'string') return null;
+        let current = href.trim();
 
-        // 形式 A：Worker 代理链接，例如 https://cldisk-dl.example.workers.dev/?url=https%3A%2F%2Fd0.cldisk.com%2F...
-        const urlParamIndex = href.indexOf('?url=');
-        if (urlParamIndex !== -1) {
-            let rawTarget = href.substring(urlParamIndex + 5);
-            // 自动解码可能存在的 URL 编码
-            if (rawTarget.startsWith('http%3A') || rawTarget.startsWith('https%3A')) {
+        for (let i = 0; i < 3; i++) {
+            if (/^https?:\/\/[^/?#]+\.(?:cldisk\.com|chaoxing\.com)\/download\//i.test(current)) {
+                return current;
+            }
+            const match = current.match(/[?&]url=(.+)$/i);
+            if (!match) break;
+
+            let next = match[1];
+            // 如果外层参数是 URL 编码的（如论坛外链跳转），先去掉外层多余参数再解码
+            if (/^https?%3A/i.test(next)) {
+                const ampIdx = next.indexOf('&');
+                if (ampIdx !== -1) {
+                    next = next.substring(0, ampIdx);
+                }
                 try {
-                    rawTarget = decodeURIComponent(rawTarget);
+                    next = decodeURIComponent(next);
                 } catch (e) {}
             }
-            if (/(?:cldisk\.com|chaoxing\.com)/i.test(rawTarget)) {
-                return rawTarget;
-            }
+            current = next;
         }
 
-        // 形式 B：原始 CDN 直链，例如 https://d0.cldisk.com/download/... 或 https://d0.ananas.chaoxing.com/download/...
-        if (/(?:cldisk\.com|chaoxing\.com)\/download\//i.test(href)) {
-            return href;
+        if (/^https?:\/\/[^/?#]+\.(?:cldisk\.com|chaoxing\.com)\/download\//i.test(current)) {
+            return current;
         }
-
         return null;
     }
 
     // =========================================================================
     // 2. 构造国内直连中转页 URL
-    // 注意：统一使用官方主站首页作为白名单中转跳板，绝不使用带有举报按钮的专属分享页
+    // 使用轻量且原生带 Referrer-Policy: unsafe-url 的 200 页面作为白名单跳板，
+    // 兼容 cldisk.com 与 ananas.chaoxing.com 全系节点，且绝不出现举报页
     // =========================================================================
     function getBridgeUrl(targetUrl, filename) {
         let hash = `#cx_dl=${encodeURIComponent(targetUrl)}`;
         if (filename) {
             hash += `&fn=${encodeURIComponent(filename)}`;
         }
-        return `https://www.chaoxing.com/${hash}`;
+        return `https://mooc1.chaoxing.com/${hash}`;
     }
 
     // =========================================================================
-    // 3. 场景 A：运行在专属中转页 (www.chaoxing.com)
+    // 3. 场景 A：地址栏直接访问原始 CDN 直链 (如 d0.cldisk.com/download/... 或 d0.ananas.chaoxing.com/download/...)
+    // 无 Referer 直接打开时源站会返回 403 HTML，脚本在此第一时间接管并跳转免流中转桥
     // =========================================================================
-    if (currentHost === 'www.chaoxing.com' || currentHost.endsWith('chaoxing.com')) {
-        // 仅在带有专属中转标记时处理，完全不影响正常的日常页面访问与办公
-        if (!location.hash.startsWith('#cx_dl=')) {
-            return;
-        }
+    if (/(?:^|\.)(?:cldisk\.com|chaoxing\.com)$/i.test(currentHost) && /^\/download\//i.test(location.pathname)) {
+        try { window.stop(); } catch (e) {}
+        location.replace(getBridgeUrl(location.href));
+        return;
+    }
 
-        // 立即阻断原网页沉重的前端加载（不加载任何无关 JS、CSS 与图片）
+    // =========================================================================
+    // 4. 场景 B：运行在白名单中转跳板页 (带有 #cx_dl= 标记)
+    // =========================================================================
+    if (currentHost.endsWith('chaoxing.com') && location.hash.startsWith('#cx_dl=')) {
         try {
             window.stop();
         } catch (e) {}
@@ -78,7 +92,6 @@
 
         if (!targetUrl) return;
 
-        // 注入现代、简洁的高速免流面板
         const bridgeHtml = `
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -226,23 +239,26 @@
                 if (hasClosed) return;
                 hasClosed = true;
                 if (statusText) {
-                    statusText.textContent = '🚀 下载已成功接管，窗口正在关闭...';
+                    statusText.textContent = '🚀 下载已成功接管，正在尝试关闭窗口...';
                     statusText.style.color = '#34d399';
                 }
                 setTimeout(() => {
                     window.close();
+                    // 若标签页是由地址栏手动打开的，浏览器出于安全策略会拦截 window.close()，给出明确提示
+                    setTimeout(() => {
+                        if (!window.closed && statusText) {
+                            statusText.textContent = '✅ 已触发免流下载！下载开始后可手动关闭或离开此页。';
+                        }
+                    }, 300);
                 }, delay);
             }
 
-            // 【智能接管检测 1】：监听窗口失焦 (IDM 弹窗或系统下载对话框弹出)
-            // 当 IDM 抓取到链接并弹出下载框时，当前标签页会立刻触发 blur，瞬间关闭中转页
+            // 信号 1：窗口失焦（IDM 弹窗或系统保存对话框弹出）
             window.addEventListener('blur', () => {
                 safeClose(100);
             });
 
-            // 【智能接管检测 2】：轻量 1 字节探针预热连接池
-            // 解决闭窗过早导致 TLS 握手夭折的问题：先用 fetch 发起 bytes=0-0 探测，
-            // 收到首字节后即代表 TCP/TLS 链路已彻底建立且直链有效，再行唤起原生下载
+            // 信号 2：轻量 1 字节探针预热连接池（同时验证链接有效性）
             const probeController = new AbortController();
             const probeTimeout = setTimeout(() => probeController.abort(), 1200);
 
@@ -256,14 +272,12 @@
                 doTrigger();
             }).catch(() => {
                 clearTimeout(probeTimeout);
-                // 即使跨域探针受阻，也立即执行直链原生点击
                 doTrigger();
             });
 
             function doTrigger() {
                 if (hasClosed) return;
 
-                // 唤起原生下载
                 const a = document.createElement('a');
                 a.href = targetUrl;
                 a.setAttribute('download', '');
@@ -275,9 +289,7 @@
                     statusText.textContent = '🚀 下载已触发，正在确认接管状态...';
                 }
 
-                // 【智能接管检测 3】：保底平稳接管
-                // 在预热完成后，浏览器的下载引擎接收 Content-Disposition 需要约 500ms~800ms
-                // 确认接管后再行关闭，绝不漏下任何链接
+                // 信号 3：预热完成后留足 900ms 让浏览器下载引擎挂载任务
                 setTimeout(() => {
                     safeClose(200);
                 }, 900);
@@ -293,40 +305,41 @@
     }
 
     // =========================================================================
-    // 4. 场景 B：运行在 Worker 域名上 (兜底重定向)
+    // 5. 场景 C：地址栏直接访问代理链接 (?url=https://d0.cldisk.com/... 或 d0.ananas.chaoxing.com/...)
     // =========================================================================
-    if (currentHost.includes('workers.dev')) {
-        const targetUrl = extractTargetUrl(location.href);
-        if (targetUrl) {
-            try { window.stop(); } catch (e) {}
-            location.replace(getBridgeUrl(targetUrl));
-            return;
+    if (!currentHost.endsWith('chaoxing.com') && !currentHost.endsWith('cldisk.com')) {
+        if (!(currentHost.includes('workers.dev') && location.pathname.startsWith('/proxy'))) {
+            const directFromAddr = extractTargetUrl(location.href);
+            if (directFromAddr) {
+                try { window.stop(); } catch (e) {}
+                location.replace(getBridgeUrl(directFromAddr));
+                return;
+            }
         }
     }
 
     // =========================================================================
-    // 5. 场景 C：运行在任意普通网页上 (事件捕获拦截目标链接)
+    // 6. 场景 D：运行在任意网页上，事件捕获拦截目标代理链接与直链
     // =========================================================================
     function handleLinkClick(e) {
         // 仅处理鼠标左键 (0) 与中键滚轮 (1)
         if (e.button !== 0 && e.button !== 1) return;
 
-        // 【自由切换特性】：若用户按住 Ctrl、Shift 或 Alt 键点击，主动跳过脚本，直接走原版 Worker 下载！
+        // 按住 Ctrl、Shift 或 Alt 键点击时，主动跳过脚本，直接走原版代理下载
         if (e.ctrlKey || e.shiftKey || e.altKey) {
             return;
         }
 
-        const anchor = e.target.closest('a');
+        const targetEl = e.target && e.target.nodeType === 1 ? e.target : (e.target && e.target.parentElement);
+        const anchor = targetEl ? targetEl.closest('a') : null;
         if (!anchor || !anchor.href) return;
 
         const targetUrl = extractTargetUrl(anchor.href);
-        if (!targetUrl) return; // 普通外链，放行
+        if (!targetUrl) return;
 
-        // 截获下载链接，阻止浏览器默认请求进入 Worker 代理
         e.preventDefault();
         e.stopPropagation();
 
-        // 提取文件名提示
         let fileName = anchor.getAttribute('download') || anchor.title || '';
         if (!fileName) {
             const text = (anchor.innerText || '').trim();
@@ -336,12 +349,9 @@
         }
 
         const bridgeUrl = getBridgeUrl(targetUrl, fileName);
-
-        // 新标签页打开中转通道，原网页完全不动
         window.open(bridgeUrl, '_blank');
     }
 
-    // 使用捕获阶段 (true)，确保优先级高于任何网站自建的 JS 事件阻止
     document.addEventListener('click', handleLinkClick, true);
     document.addEventListener('auxclick', handleLinkClick, true);
 })();
