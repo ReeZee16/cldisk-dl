@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         cldisk-dl
 // @namespace    https://github.com/ReeZee16/cldisk-dl
-// @version      1.4.0
+// @version      1.4.1
 // @description  免梯子流量下载！支持论坛点击与地址栏直链直接访问，自动容灾切换国内高速节点。
 // @author       Antigravity
 // @match        *://*/*
@@ -65,7 +65,7 @@
     }
 
     // =========================================================================
-    // 3. 场景 A：地址栏直接访问原始 CDN 直链 (如 d0.cldisk.com/download/... 或 d0.ananas.chaoxing.com/download/...)
+    // 3. 场景 A：地址栏直接访问原始 CDN 直链
     // 加设 sessionStorage 防循环锁，彻底杜绝 403 反复横跳
     // =========================================================================
     if (/(?:^|\.)(?:cldisk\.com|chaoxing\.com)$/i.test(currentHost) && /^\/download\//i.test(location.pathname)) {
@@ -224,7 +224,7 @@
 <body>
     <div class="card">
         <div class="icon">⚡</div>
-        <h2 id="cx-title">免流直连通道检测中</h2>
+        <h2 id="cx-title">免流直连下载准备中</h2>
         
         <div class="file-info">
             <div class="file-name" id="cx-fname"></div>
@@ -238,8 +238,8 @@
         </div>
 
         <a id="cx-manual-btn" class="btn-retry" href="#">若未开始下载，点此手动下载</a>
-        <a id="cx-fallback-btn" class="btn-fallback" href="#">直连失败？点此改用原版代理节点下载</a>
-        <div class="status-hint" id="cx-status-text">⚡ 正在检测并预热国内高速 CDN 节点...</div>
+        <a id="cx-fallback-btn" class="btn-fallback" href="#">如直连异常，点此改用原版代理节点下载</a>
+        <div class="status-hint" id="cx-status-text">⚡ 正在匹配国内最优 CDN 节点...</div>
     </div>
 </body>
 </html>
@@ -249,14 +249,12 @@
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), 3500);
             try {
-                // 不添加 Range 等自定义请求头，避免触发 d0.cldisk.com 的 OPTIONS 预检 403
                 const resp = await fetch(url, {
                     method: 'GET',
                     signal: controller.signal
                 });
                 const ok = resp.ok;
                 const status = resp.status;
-                // 收到响应头后立刻中止请求，避免探测阶段拉取大文件正文
                 controller.abort();
                 clearTimeout(timeoutId);
                 return { ok, status };
@@ -284,9 +282,15 @@
             }
 
             let hasClosed = false;
+            let takenOverByExt = false;
+
             function safeClose(delay = 200) {
                 if (hasClosed) return;
                 hasClosed = true;
+                if (titleEl) {
+                    titleEl.textContent = '免流直连下载已触发';
+                    titleEl.style.color = '#38bdf8';
+                }
                 if (statusText) {
                     statusText.textContent = '🚀 下载已成功接管，正在尝试关闭窗口...';
                     statusText.style.color = '#34d399';
@@ -301,18 +305,17 @@
                 }, delay);
             }
 
-            // 构造候选 CDN 节点列表：
-            // 部分旧时间戳链接在国内 ananas 节点会被火山 CDN 报 403 too old time，
-            // 自动切换至同源的 d0.cldisk.com（网宿国内节点）即可满速直连放行！
+            // 提前绑定失焦监听：当 IDM 等下载扩展在探测或下载阶段直接拦截请求并弹窗时，立刻识别为接管成功
+            window.addEventListener('blur', () => {
+                takenOverByExt = true;
+                safeClose(120);
+            });
+
+            // 构造候选节点列表
             const candidates = [rawTargetUrl];
             try {
                 const parsed = new URL(rawTargetUrl);
-                if (/ananas\.chaoxing\.com$/i.test(parsed.hostname)) {
-                    const swapped = new URL(rawTargetUrl);
-                    swapped.hostname = 'd0.cldisk.com';
-                    // 对于 ananas 节点，优先保留原节点在第一位还是 cldisk 在第二位均可在毫秒级探测切换
-                    candidates.push(swapped.toString());
-                } else if (!/^d0\.cldisk\.com$/i.test(parsed.hostname)) {
+                if (!/^d0\.cldisk\.com$/i.test(parsed.hostname)) {
                     const swapped = new URL(rawTargetUrl);
                     swapped.hostname = 'd0.cldisk.com';
                     candidates.push(swapped.toString());
@@ -321,29 +324,48 @@
 
             let activeUrl = null;
             let lastStatus = 0;
+            let hadNetworkAbort = false;
+            let lastTriedUrl = rawTargetUrl;
 
             for (let i = 0; i < candidates.length; i++) {
+                if (takenOverByExt || hasClosed) return;
                 const candidate = candidates[i];
-                if (i > 0 && statusText) {
-                    statusText.textContent = '🔄 主节点返回 403，正在自动切换国内备用 CDN 节点...';
-                }
+                lastTriedUrl = candidate;
                 const res = await probeSimpleGet(candidate);
+                if (takenOverByExt || hasClosed) return;
+
                 lastStatus = res.status;
                 if (res.ok) {
                     activeUrl = candidate;
                     break;
                 }
+                if (res.status === 0) {
+                    hadNetworkAbort = true;
+                }
+            }
+
+            // 若探测被中断 (status: 0)，可能是 IDM/下载扩展拦截了 fetch 请求，稍等 450ms 确认是否触发弹窗失焦
+            if (!activeUrl && hadNetworkAbort) {
+                if (statusText) statusText.textContent = '⚡ 正在确认下载器接管状态...';
+                await new Promise((r) => setTimeout(r, 450));
+                if (takenOverByExt || hasClosed) return;
+            }
+
+            // 仅当最后一个节点未返回明确的 4xx/5xx HTTP 错误时，才用优选节点触发一次原生下载
+            if (!activeUrl && lastStatus < 400) {
+                activeUrl = lastTriedUrl;
             }
 
             if (!activeUrl) {
-                // 所有国内直连候选均返回 403/失败时，绝不执行 a.click() 跳转至 403 页面，彻底避免死循环
+                // 仅在所有国内节点均明确返回 HTTP 403/404 时才提示改用代理，绝不触发 403 死循环
+                if (manualBtn) manualBtn.href = lastTriedUrl;
                 if (titleEl) {
-                    titleEl.textContent = '国内直连节点受限';
+                    titleEl.textContent = '免流直连节点不可用';
                     titleEl.style.color = '#fbbf24';
                 }
                 if (statusText) {
-                    statusText.textContent = `⚠️ 直连探测返回 HTTP ${lastStatus || '网络异常'}，已阻断跳转以防 403 循环。请尝试点击下方代理下载按钮。`;
-                    statusText.style.color = '#fbbf24';
+                    statusText.textContent = `直连节点返回 HTTP ${lastStatus}，请点击下方按钮切换原版代理下载。`;
+                    statusText.style.color = '#cbd5e1';
                 }
                 if (fallbackBtn && origUrl) {
                     fallbackBtn.style.display = 'inline-block';
@@ -351,21 +373,21 @@
                 return;
             }
 
-            // 更新最终确认可用的国内直连地址
+            // 更新确认可用的直连地址并触发下载
             if (manualBtn) manualBtn.href = activeUrl;
             try {
                 const activeHost = new URL(activeUrl).hostname;
-                if (nodeInfoEl) nodeInfoEl.textContent = `目标源：${activeHost}（国内高速 CDN 已校验放行）`;
+                if (nodeInfoEl) nodeInfoEl.textContent = `目标源：${activeHost}（国内高速 CDN 已就绪）`;
             } catch (e) {}
-            if (titleEl) titleEl.textContent = '免流直连下载已触发';
-            if (statusText) statusText.textContent = '🟢 CDN 握手成功，正在确认接管状态...';
+            if (titleEl) {
+                titleEl.textContent = '免流直连下载已触发';
+                titleEl.style.color = '#38bdf8';
+            }
+            if (statusText) {
+                statusText.textContent = '🟢 CDN 握手成功，正在确认接管状态...';
+                statusText.style.color = '#38bdf8';
+            }
 
-            // 监听窗口失焦（IDM 弹窗或系统保存对话框弹出）
-            window.addEventListener('blur', () => {
-                safeClose(100);
-            });
-
-            // 唤起浏览器原生或 IDM 下载
             const a = document.createElement('a');
             a.href = activeUrl;
             a.setAttribute('download', '');
@@ -388,7 +410,6 @@
 
     // =========================================================================
     // 5. 场景 C：地址栏直接访问代理链接 (?url=...)
-    // 注：仅当代理站点返回 HTML 网页时可被油猴捕获；若代理直接下发二进制附件则由浏览器直接接管下载
     // =========================================================================
     if (!currentHost.endsWith('chaoxing.com') && !currentHost.endsWith('cldisk.com')) {
         const bypass = location.hash.includes('cx_bypass=1') || location.pathname.startsWith('/proxy');
@@ -417,7 +438,6 @@
         const anchor = targetEl ? targetEl.closest('a') : null;
         if (!anchor || !anchor.href) return;
 
-        // 若链接自带跳过标记（例如降级按钮），放行
         if (anchor.href.includes('#cx_bypass=1')) return;
 
         const targetUrl = extractTargetUrl(anchor.href);
