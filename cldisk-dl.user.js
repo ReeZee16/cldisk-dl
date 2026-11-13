@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         cldisk-dl
 // @namespace    https://github.com/ReeZee16/cldisk-dl
-// @version      1.4.3
+// @version      1.4.4
 // @description  免梯子流量下载！支持论坛点击与地址栏直链直接访问，自动容灾切换国内高速节点。
 // @author       Antigravity
 // @match        *://*/*
@@ -298,12 +298,36 @@
             let downloadHandoffDetected = false;
             let closeTimer = null;
             let closeAt = 0;
+            let closePending = false;
 
             function safeClose(delay = 200) {
-                if (hasClosed) return;
-                hasClosed = true;
+                if (hasClosed || closePending) return;
+                closePending = true;
                 if (closeTimer) clearTimeout(closeTimer);
-                setTimeout(() => window.close(), delay);
+                setTimeout(() => {
+                    try { window.close(); } catch (e) {}
+                    setTimeout(() => {
+                        closePending = false;
+                        if (window.closed) {
+                            hasClosed = true;
+                            return;
+                        }
+                        // Browsers block window.close() for tabs opened from the address bar.
+                        // Return to the previous history entry when possible; otherwise keep retries usable.
+                        if (history.length > 1) {
+                            if (statusText) statusText.textContent = '正在返回上一页并结束下载页面...';
+                            history.back();
+                            setTimeout(() => {
+                                closePending = false;
+                                if (!hasClosed && statusText) {
+                                    statusText.textContent = '浏览器不允许自动关闭此标签页；你仍可点击重试按钮，或手动关闭页面。';
+                                }
+                            }, 300);
+                            return;
+                        }
+                        if (statusText) statusText.textContent = '浏览器不允许自动关闭此标签页；你仍可点击重试按钮，或手动关闭页面。';
+                    }, 100);
+                }, delay);
             }
 
             function scheduleClose(delay) {
@@ -329,6 +353,42 @@
                 safeClose(200);
             }
 
+            let activeUrl = null;
+            let manualRetryBound = false;
+
+            function triggerDirectDownload() {
+                if (!activeUrl) throw new Error('No direct URL available');
+                const directLink = document.createElement('a');
+                directLink.href = activeUrl;
+                directLink.setAttribute('download', '');
+                directLink.style.display = 'none';
+                document.body.appendChild(directLink);
+                downloadTriggered = true;
+                directLink.click();
+            }
+
+            function enableManualRetry() {
+                if (!manualBtn || manualRetryBound) return;
+                manualRetryBound = true;
+                manualBtn.disabled = false;
+                manualBtn.addEventListener('click', () => {
+                    if (manualBtn.disabled || hasClosed) return;
+                    manualBtn.disabled = true;
+                    try {
+                        triggerDirectDownload();
+                        if (titleEl) titleEl.textContent = '已重新开始免流下载';
+                        if (statusText) statusText.textContent = '已重新发起免流下载；如未开始，可使用代理流量重试。';
+                    } catch (e) {
+                        if (statusText) statusText.textContent = '免流重试未能启动；请使用代理流量重试。';
+                    }
+                    closeAt = Math.max(closeAt, Date.now()) + 2000;
+                    scheduleClose(Math.max(0, closeAt - Date.now()));
+                    setTimeout(() => {
+                        if (!hasClosed) manualBtn.disabled = false;
+                    }, 1250);
+                });
+            }
+
             // IDM 等外部下载器接管时，浏览器通常会让页面失焦；下载触发前不监听，避免探测阶段误判。
             window.addEventListener('blur', detectDownloadHandoff);
             document.addEventListener('visibilitychange', () => {
@@ -346,7 +406,6 @@
                 }
             } catch (e) {}
 
-            let activeUrl = null;
             let lastStatus = 0;
             let hadNetworkAbort = false;
             let lastTriedUrl = rawTargetUrl;
@@ -391,6 +450,8 @@
 
             if (!activeUrl) {
                 // 仅在所有国内节点均明确返回 HTTP 403/404 时才提示改用代理，绝不触发 403 死循环
+                activeUrl = lastTriedUrl;
+                enableManualRetry();
                 if (titleEl) {
                     titleEl.textContent = '免流直连节点不可用';
                     titleEl.style.color = '#fbbf24';
@@ -417,35 +478,7 @@
                 statusText.style.color = '#38bdf8';
             }
 
-            function triggerDirectDownload() {
-                const directLink = document.createElement('a');
-                directLink.href = activeUrl;
-                directLink.setAttribute('download', '');
-                directLink.style.display = 'none';
-                document.body.appendChild(directLink);
-                downloadTriggered = true;
-                directLink.click();
-            }
-
-            if (manualBtn) {
-                manualBtn.disabled = false;
-                manualBtn.addEventListener('click', () => {
-                    if (manualBtn.disabled || hasClosed) return;
-                    manualBtn.disabled = true;
-                    try {
-                        triggerDirectDownload();
-                        if (titleEl) titleEl.textContent = '已重新开始免流下载';
-                        if (statusText) statusText.textContent = '已重新发起免流下载；如未开始，可使用代理流量重试。';
-                    } catch (e) {
-                        if (statusText) statusText.textContent = '免流重试未能启动；请使用代理流量重试。';
-                    }
-                    closeAt += 2000;
-                    scheduleClose(Math.max(0, closeAt - Date.now()));
-                    setTimeout(() => {
-                        if (!hasClosed) manualBtn.disabled = false;
-                    }, 1250);
-                });
-            }
+            enableManualRetry();
 
             if (fallbackBtn) {
                 fallbackBtn.addEventListener('click', () => {
